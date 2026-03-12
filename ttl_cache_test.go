@@ -220,7 +220,7 @@ func TestTTLCacheEviction(t *testing.T) {
 }
 
 func TestTTLCachePeek(t *testing.T) {
-	cache := NewTTLCache[int, int](64)
+	cache := NewTTLCache[int, int](64, WithShards[int, int](1))
 
 	cache.Set(10, 10, 0)
 	cache.Set(20, 20, time.Hour)
@@ -243,7 +243,7 @@ func TestTTLCachePeek(t *testing.T) {
 		t.Errorf("%v should not have updated recent-ness of 10", v)
 	}
 	if v, _, ok := cache.Peek(30); ok || v != 0 {
-		t.Errorf("%v should have updated recent-ness of 30", v)
+		t.Errorf("%v should still be absent after miss peek", v)
 	}
 }
 
@@ -285,6 +285,198 @@ func TestTTLCacheAppendAllKeys(t *testing.T) {
 	allKeys := cache.AppendAllKeys(nil)
 	if got, want := len(allKeys), 2; got != want {
 		t.Fatalf("AppendAllKeys should include expired keys, got %d", got)
+	}
+}
+
+func TestTTLCacheAppendAllKeysAcrossShards(t *testing.T) {
+	cache := NewTTLCache[string, int](32, WithShards[string, int](4))
+
+	keys := []string{"a", "b", "c", "d", "e", "f"}
+	for i, key := range keys {
+		cache.Set(key, i+1, time.Hour)
+	}
+
+	cache.Delete("b")
+	cache.Delete("e")
+
+	allKeys := cache.AppendAllKeys(nil)
+	if got, want := len(allKeys), 4; got != want {
+		t.Fatalf("AppendAllKeys should include all remaining keys across shards, got %v", allKeys)
+	}
+
+	seen := make(map[string]bool, len(allKeys))
+	for _, key := range allKeys {
+		seen[key] = true
+	}
+
+	for _, key := range []string{"a", "c", "d", "f"} {
+		if !seen[key] {
+			t.Fatalf("expected key %q in AppendAllKeys result, got %v", key, allKeys)
+		}
+	}
+	for _, key := range []string{"b", "e"} {
+		if seen[key] {
+			t.Fatalf("deleted key %q should not appear in AppendAllKeys result %v", key, allKeys)
+		}
+	}
+}
+
+func TestTTLCacheShardCapacityIsLocal(t *testing.T) {
+	cache := NewTTLCache[string, int](
+		8,
+		WithShards[string, int](4),
+		WithHasher[string, int](func(key unsafe.Pointer, seed uintptr) uintptr { return 0 }),
+	)
+
+	cache.Set("a", 1, time.Hour)
+	cache.Set("b", 2, time.Hour)
+	cache.Set("c", 3, time.Hour)
+
+	if keys := cache.AppendAllKeys(nil); len(keys) != 2 {
+		t.Fatalf("expected only 2 keys to remain in the forced shard, got %v", keys)
+	}
+	if _, ok := cache.Get("a"); ok {
+		t.Fatal("expected oldest key to be evicted once shard-local capacity is exceeded")
+	}
+	if v, ok := cache.Get("b"); !ok || v != 2 {
+		t.Fatalf("expected newer key b to remain, got value=%v ok=%v", v, ok)
+	}
+	if v, ok := cache.Get("c"); !ok || v != 3 {
+		t.Fatalf("expected newer key c to remain, got value=%v ok=%v", v, ok)
+	}
+}
+
+func TestTTLCacheGetWithStateSlidingExtendsTTL(t *testing.T) {
+	cache := NewTTLCache[string, int](16, WithSliding[string, int](true), WithShards[string, int](1))
+	cache.Set("a", 1, 3*time.Second)
+
+	_, expiresBefore, ok := cache.Peek("a")
+	if !ok || expiresBefore == 0 {
+		t.Fatalf("expected key a to exist before sliding read, expires=%v ok=%v", expiresBefore, ok)
+	}
+
+	time.Sleep(1100 * time.Millisecond)
+
+	if v, state := cache.GetWithState("a"); state != TTLStateHit || v != 1 {
+		t.Fatalf("expected hit state for key a, got value=%v state=%v", v, state)
+	}
+
+	_, expiresAfter, ok := cache.Peek("a")
+	if !ok || expiresAfter <= expiresBefore {
+		t.Fatalf("expected sliding GetWithState to extend ttl, before=%v after=%v ok=%v", expiresBefore, expiresAfter, ok)
+	}
+}
+
+func TestTTLCacheGetWithStateExpiredThenDelete(t *testing.T) {
+	cache := NewTTLCache[string, int](16, WithSliding[string, int](true), WithShards[string, int](1))
+	cache.Set("a", 1, 1*time.Second)
+
+	time.Sleep(2100 * time.Millisecond)
+
+	if v, state := cache.GetWithState("a"); state != TTLStateExpired || v != 1 {
+		t.Fatalf("expected expired state for key a, got value=%v state=%v", v, state)
+	}
+	if keys := cache.AppendKeys(nil); len(keys) != 0 {
+		t.Fatalf("expected expired key to stay out of AppendKeys, got %v", keys)
+	}
+
+	cache.Delete("a")
+
+	if v, state := cache.GetWithState("a"); state != TTLStateMiss || v != 0 {
+		t.Fatalf("expected miss state after delete, got value=%v state=%v", v, state)
+	}
+	if keys := cache.AppendAllKeys(nil); len(keys) != 0 {
+		t.Fatalf("expected deleted key to disappear from AppendAllKeys, got %v", keys)
+	}
+}
+
+func TestTTLCacheAppendAllKeysDeleteRemovesKey(t *testing.T) {
+	cache := NewTTLCache[string, int](16, WithShards[string, int](1))
+	cache.Set("a", 1, 0)
+	cache.Set("b", 2, 0)
+
+	cache.Delete("a")
+
+	keys := cache.AppendAllKeys(nil)
+	if got, want := len(keys), 1; got != want {
+		t.Fatalf("expected one key after delete, got %v", keys)
+	}
+	if keys[0] != "b" {
+		t.Fatalf("expected only key b to remain, got %v", keys)
+	}
+}
+
+func TestTTLCacheAppendAllKeysSetReplaceNoDuplicate(t *testing.T) {
+	cache := NewTTLCache[string, int](16, WithShards[string, int](1))
+	cache.Set("a", 1, 3*time.Second)
+	cache.Set("a", 2, 0)
+
+	keys := cache.AppendAllKeys(nil)
+	if got, want := len(keys), 1; got != want {
+		t.Fatalf("expected one key after replace, got %v", keys)
+	}
+	if keys[0] != "a" {
+		t.Fatalf("expected key a after replace, got %v", keys)
+	}
+	if v, state := cache.GetWithState("a"); state != TTLStateHit || v != 2 {
+		t.Fatalf("expected replaced value for key a, got value=%v state=%v", v, state)
+	}
+}
+
+func TestTTLCacheAppendAllKeysEvictionDropsOldKey(t *testing.T) {
+	cache := NewTTLCache[string, int](2, WithShards[string, int](1))
+	cache.Set("a", 1, 0)
+	cache.Set("b", 2, 0)
+	cache.Set("c", 3, 0)
+
+	keys := cache.AppendAllKeys(nil)
+	if got, want := len(keys), 2; got != want {
+		t.Fatalf("expected two keys after eviction, got %v", keys)
+	}
+
+	gotA, gotB, gotC := false, false, false
+	for _, key := range keys {
+		switch key {
+		case "a":
+			gotA = true
+		case "b":
+			gotB = true
+		case "c":
+			gotC = true
+		}
+	}
+	if gotA || !gotB || !gotC {
+		t.Fatalf("expected keys b and c after eviction, got %v", keys)
+	}
+}
+
+func TestTTLCacheGetWithStateExpiredDoesNotUpdateRecency(t *testing.T) {
+	cache := NewTTLCache[string, int](2, WithShards[string, int](1))
+	cache.Set("a", 1, 1*time.Second)
+	cache.Set("b", 2, 0)
+
+	time.Sleep(2100 * time.Millisecond)
+
+	if v, state := cache.GetWithState("a"); state != TTLStateExpired || v != 1 {
+		t.Fatalf("expected expired state for key a, got value=%v state=%v", v, state)
+	}
+
+	cache.Set("c", 3, 0)
+
+	keys := cache.AppendAllKeys(nil)
+	gotA, gotB, gotC := false, false, false
+	for _, key := range keys {
+		switch key {
+		case "a":
+			gotA = true
+		case "b":
+			gotB = true
+		case "c":
+			gotC = true
+		}
+	}
+	if gotA || !gotB || !gotC {
+		t.Fatalf("expected expired key a to remain LRU and be evicted, got %v", keys)
 	}
 }
 

@@ -5,7 +5,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/phuslu/lru"
+	"github.com/yeqiaojun/lru"
 )
 
 func ExampleWithHasher() {
