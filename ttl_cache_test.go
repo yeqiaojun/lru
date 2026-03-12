@@ -247,6 +247,47 @@ func TestTTLCachePeek(t *testing.T) {
 	}
 }
 
+func TestTTLCacheGetWithState(t *testing.T) {
+	cache := NewTTLCache[int, int](64, WithShards[int, int](1))
+
+	cache.Set(1, 10, 0)
+	if v, state := cache.GetWithState(1); state != TTLStateHit || v != 10 {
+		t.Fatalf("expected hit state for key 1, got value=%v state=%v", v, state)
+	}
+
+	cache.Set(2, 20, 1*time.Second)
+	time.Sleep(2100 * time.Millisecond)
+
+	if v, state := cache.GetWithState(2); state != TTLStateExpired || v != 20 {
+		t.Fatalf("expected expired state for key 2, got value=%v state=%v", v, state)
+	}
+	if v, _, ok := cache.Peek(2); !ok || v != 20 {
+		t.Fatalf("expected expired key 2 to remain visible after GetWithState, got value=%v ok=%v", v, ok)
+	}
+
+	if v, state := cache.GetWithState(3); state != TTLStateMiss || v != 0 {
+		t.Fatalf("expected miss state for key 3, got value=%v state=%v", v, state)
+	}
+}
+
+func TestTTLCacheAppendAllKeys(t *testing.T) {
+	cache := NewTTLCache[int, int](64, WithShards[int, int](1))
+
+	cache.Set(1, 10, 0)
+	cache.Set(2, 20, 1*time.Second)
+	time.Sleep(2100 * time.Millisecond)
+
+	keys := cache.AppendKeys(nil)
+	if got, want := len(keys), 1; got != want {
+		t.Fatalf("AppendKeys should only include active keys, got %d", got)
+	}
+
+	allKeys := cache.AppendAllKeys(nil)
+	if got, want := len(allKeys), 2; got != want {
+		t.Fatalf("AppendAllKeys should include expired keys, got %d", got)
+	}
+}
+
 func TestTTLCacheHasher(t *testing.T) {
 	cache := NewTTLCache[string, int](1024, WithHasher[string, int](func(key unsafe.Pointer, seed uintptr) (x uintptr) {
 		x = 5381

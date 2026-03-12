@@ -89,6 +89,37 @@ func (s *ttlshard[K, V]) Get(hash uint32, key K) (value V, ok bool) {
 	return
 }
 
+func (s *ttlshard[K, V]) GetWithState(hash uint32, key K) (value V, state TTLState) {
+	s.mu.Lock()
+
+	s.statsGetCalls++
+
+	if index, exists := s.tableGet(hash, key); exists {
+		if expires := s.list[index].expires; expires == 0 {
+			s.listMoveToFront(index)
+			value = (*ttlnode[K, V])(unsafe.Add(unsafe.Pointer(&s.list[0]), uintptr(index)*unsafe.Sizeof(s.list[0]))).value
+			state = TTLStateHit
+		} else if now := atomic.LoadUint32(&clock); now < expires {
+			if s.sliding {
+				s.list[index].expires = now + s.list[index].ttl
+			}
+			s.listMoveToFront(index)
+			value = (*ttlnode[K, V])(unsafe.Add(unsafe.Pointer(&s.list[0]), uintptr(index)*unsafe.Sizeof(s.list[0]))).value
+			state = TTLStateHit
+		} else {
+			value = (*ttlnode[K, V])(unsafe.Add(unsafe.Pointer(&s.list[0]), uintptr(index)*unsafe.Sizeof(s.list[0]))).value
+			state = TTLStateExpired
+			s.statsMisses++
+		}
+	} else {
+		s.statsMisses++
+	}
+
+	s.mu.Unlock()
+
+	return
+}
+
 func (s *ttlshard[K, V]) Peek(hash uint32, key K) (value V, expires int64, ok bool) {
 	s.mu.Lock()
 
@@ -240,6 +271,20 @@ func (s *ttlshard[K, V]) AppendKeys(dst []K, now uint32) []K {
 		if expires := node.expires; expires == 0 || now <= expires {
 			dst = append(dst, node.key)
 		}
+	}
+	s.mu.Unlock()
+
+	return dst
+}
+
+func (s *ttlshard[K, V]) AppendAllKeys(dst []K) []K {
+	s.mu.Lock()
+	for _, bucket := range s.tableBuckets {
+		b := (*ttlbucket)(unsafe.Pointer(&bucket))
+		if b.index == 0 {
+			continue
+		}
+		dst = append(dst, s.list[b.index].key)
 	}
 	s.mu.Unlock()
 

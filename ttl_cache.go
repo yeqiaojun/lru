@@ -19,6 +19,14 @@ type TTLCache[K comparable, V any] struct {
 	group  singleflightGroup[K, V]
 }
 
+type TTLState uint8
+
+const (
+	TTLStateMiss TTLState = iota
+	TTLStateHit
+	TTLStateExpired
+)
+
 // NewTTLCache creates lru cache with size capacity.
 func NewTTLCache[K comparable, V any](size int, options ...Option[K, V]) *TTLCache[K, V] {
 	clocking()
@@ -74,6 +82,12 @@ func (c *TTLCache[K, V]) Get(key K) (value V, ok bool) {
 	hash := uint32(c.hasher(noescape(unsafe.Pointer(&key)), c.seed))
 	// return c.shards[hash&c.mask].Get(hash, key)
 	return (*ttlshard[K, V])(unsafe.Add(unsafe.Pointer(&c.shards[0]), uintptr(hash&c.mask)*unsafe.Sizeof(c.shards[0]))).Get(hash, key)
+}
+
+// GetWithState returns value and cache state for key without deleting expired entries.
+func (c *TTLCache[K, V]) GetWithState(key K) (value V, state TTLState) {
+	hash := uint32(c.hasher(noescape(unsafe.Pointer(&key)), c.seed))
+	return (*ttlshard[K, V])(unsafe.Add(unsafe.Pointer(&c.shards[0]), uintptr(hash&c.mask)*unsafe.Sizeof(c.shards[0]))).GetWithState(hash, key)
 }
 
 // GetOrLoad returns value for key, call loader function by singleflight if value was not in cache.
@@ -143,6 +157,14 @@ func (c *TTLCache[K, V]) AppendKeys(keys []K) []K {
 	now := atomic.LoadUint32(&clock)
 	for i := uint32(0); i <= c.mask; i++ {
 		keys = c.shards[i].AppendKeys(keys, now)
+	}
+	return keys
+}
+
+// AppendAllKeys appends all keys to keys including expired entries.
+func (c *TTLCache[K, V]) AppendAllKeys(keys []K) []K {
+	for i := uint32(0); i <= c.mask; i++ {
+		keys = c.shards[i].AppendAllKeys(keys)
 	}
 	return keys
 }
