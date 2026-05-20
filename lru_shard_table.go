@@ -46,8 +46,8 @@ func (s *lrushard[K, V]) tableSet(hash uint32, key K, index uint32) (prev uint32
 	hdib := subhash<<dibBitSize | uint32(1)&maxDIB
 	mask := s.tableMask
 	i := subhash & mask
-	b0 := unsafe.Pointer(&s.tableBuckets[0])
-	l0 := unsafe.Pointer(&s.list[0])
+	b0 := unsafe.Pointer(unsafe.SliceData(s.tableBuckets))
+	l0 := unsafe.Pointer(unsafe.SliceData(s.list))
 	for {
 		b := (*lrubucket)(unsafe.Add(b0, uintptr(i)*8))
 		if b.hdib&maxDIB == 0 {
@@ -78,17 +78,20 @@ func (s *lrushard[K, V]) tableGet(hash uint32, key K) (index uint32, ok bool) {
 	subhash := hash >> dibBitSize
 	mask := s.tableMask
 	i := subhash & mask
-	b0 := unsafe.Pointer(&s.tableBuckets[0])
-	l0 := unsafe.Pointer(&s.list[0])
+	dib := uint32(1)
+	b0 := unsafe.Pointer(unsafe.SliceData(s.tableBuckets))
+	l0 := unsafe.Pointer(unsafe.SliceData(s.list))
 	for {
 		b := (*lrubucket)(unsafe.Add(b0, uintptr(i)*8))
-		if b.hdib&maxDIB == 0 {
+		bdib := b.hdib & maxDIB
+		if bdib == 0 || bdib < dib {
 			return
 		}
 		if b.hdib>>dibBitSize == subhash && (*lrunode[K, V])(unsafe.Add(l0, uintptr(b.index)*unsafe.Sizeof(s.list[0]))).key == key {
 			return b.index, true
 		}
 		i = (i + 1) & mask
+		dib++
 	}
 }
 
@@ -98,11 +101,13 @@ func (s *lrushard[K, V]) tableDelete(hash uint32, key K) (index uint32, ok bool)
 	subhash := hash >> dibBitSize
 	mask := s.tableMask
 	i := subhash & mask
-	b0 := unsafe.Pointer(&s.tableBuckets[0])
-	l0 := unsafe.Pointer(&s.list[0])
+	dib := uint32(1)
+	b0 := unsafe.Pointer(unsafe.SliceData(s.tableBuckets))
+	l0 := unsafe.Pointer(unsafe.SliceData(s.list))
 	for {
 		b := (*lrubucket)(unsafe.Add(b0, uintptr(i)*8))
-		if b.hdib&maxDIB == 0 {
+		bdib := b.hdib & maxDIB
+		if bdib == 0 || bdib < dib {
 			return
 		}
 		if b.hdib>>dibBitSize == subhash && (*lrunode[K, V])(unsafe.Add(l0, uintptr(b.index)*unsafe.Sizeof(s.list[0]))).key == key {
@@ -111,12 +116,13 @@ func (s *lrushard[K, V]) tableDelete(hash uint32, key K) (index uint32, ok bool)
 			return old, true
 		}
 		i = (i + 1) & mask
+		dib++
 	}
 }
 
 func (s *lrushard[K, V]) tableDeleteByIndex(i uint32) {
 	mask := s.tableMask
-	b0 := unsafe.Pointer(&s.tableBuckets[0])
+	b0 := unsafe.Pointer(unsafe.SliceData(s.tableBuckets))
 	bi := (*lrubucket)(unsafe.Add(b0, uintptr(i)*8))
 	bi.hdib = bi.hdib>>dibBitSize<<dibBitSize | uint32(0)&maxDIB
 	for {

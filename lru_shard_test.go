@@ -3,7 +3,6 @@ package lru
 import (
 	"fmt"
 	"testing"
-	"time"
 	"unsafe"
 )
 
@@ -44,19 +43,41 @@ func TestLRUShardTableSet(t *testing.T) {
 	}
 }
 
-func TestLRUCacheLengthWithZeroValue(t *testing.T) {
-	cache := NewTTLCache[string, string](128, WithShards[string, string](1))
+func TestLRUShardTableDeleteMissing(t *testing.T) {
+	var s lrushard[string, int]
+	s.Init(8, getRuntimeHasher[string](), 0)
 
-	cache.Set("", "", time.Hour)
-	cache.Set("1", "1", time.Hour)
+	key := "present"
+	hash := uint32(s.tableHasher(noescape(unsafe.Pointer(&key)), s.tableSeed))
+	s.Set(hash, key, 1)
+
+	missing := "missing"
+	missingHash := uint32(s.tableHasher(noescape(unsafe.Pointer(&missing)), s.tableSeed))
+	index, ok := s.tableDelete(missingHash, missing)
+	if ok || index != 0 {
+		t.Fatalf("missing key should not delete an index: index=%d ok=%v", index, ok)
+	}
+	if got, want := s.tableLength, uint32(1); got != want {
+		t.Fatalf("table length should be unchanged: got=%d want=%d", got, want)
+	}
+	if got, ok := s.Get(hash, key); !ok || got != 1 {
+		t.Fatalf("present key should remain cached: value=%d ok=%v", got, ok)
+	}
+}
+
+func TestLRUCacheLengthWithZeroValue(t *testing.T) {
+	cache := NewLRUCache[string, string](128, WithShards[string, string](1))
+
+	cache.Set("", "")
+	cache.Set("1", "1")
 
 	if got, want := cache.Len(), 2; got != want {
-		t.Fatalf("curent cache length %v should be %v", got, want)
+		t.Fatalf("current cache length %v should be %v", got, want)
 	}
 
 	for i := 2; i < 128; i++ {
 		k := fmt.Sprintf("%d", i)
-		if _, replace := cache.Set(k, k, time.Hour); replace {
+		if _, replace := cache.Set(k, k); replace {
 			t.Fatalf("key %v should not be replaced", k)
 		}
 	}
@@ -71,7 +92,7 @@ func TestLRUCacheLengthWithZeroValue(t *testing.T) {
 		if i-128 > 0 {
 			v = fmt.Sprintf("%d", i-128)
 		}
-		if prev, _ := cache.Set(k, k, time.Hour); prev != v {
+		if prev, _ := cache.Set(k, k); prev != v {
 			t.Fatalf("value %v should be evicted", prev)
 		}
 	}

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,9 +13,6 @@ import (
 )
 
 func TestTTLCacheCompactness(t *testing.T) {
-	if runtime.GOARCH != "amd64" {
-		return
-	}
 	compact := isamd64
 	defer func() {
 		isamd64 = compact
@@ -24,14 +20,24 @@ func TestTTLCacheCompactness(t *testing.T) {
 
 	for _, b := range []bool{true, false} {
 		isamd64 = b
-		cache := NewTTLCache[string, []byte](32 * 1024)
+		cache := NewTTLCache[string, []byte](32, WithShards[string, []byte](4))
 		if length := cache.Len(); length != 0 {
 			t.Fatalf("bad cache length: %v", length)
+		}
+		if got, want := cache.mask+1, uint32(4); got != want {
+			t.Fatalf("bad shard count: got=%d want=%d", got, want)
+		}
+		if got, want := len(cache.shards[0].list), 9; got != want {
+			t.Fatalf("bad shard list size for compact=%v: got=%d want=%d", b, got, want)
+		}
+		cache.Set("a", []byte("1"), time.Hour)
+		if v, ok := cache.Get("a"); !ok || string(v) != "1" {
+			t.Fatalf("cache should work with compact=%v: value=%q ok=%v", b, v, ok)
 		}
 	}
 }
 
-func TestTTLCacheDefaultkey(t *testing.T) {
+func TestTTLCacheDefaultKey(t *testing.T) {
 	cache := NewTTLCache[string, int](1)
 	var k string
 	var i int = 10
@@ -61,11 +67,11 @@ func TestTTLCacheGetSet(t *testing.T) {
 	}
 
 	if v, replaced := cache.Set(5, 9, 0); v != 10 || !replaced {
-		t.Fatal("old value should be evicted")
+		t.Fatalf("set should return previous value 10 and replaced=true: value=%d replaced=%v", v, replaced)
 	}
 
 	if v, replaced := cache.Set(5, 9, 0); v != 9 || !replaced {
-		t.Fatal("old value should be evicted")
+		t.Fatalf("set should return previous value 9 and replaced=true: value=%d replaced=%v", v, replaced)
 	}
 
 	if v, ok := cache.Get(5); !ok || v != 9 {
@@ -80,7 +86,7 @@ func TestTTLCacheLengthWithZeroValue(t *testing.T) {
 	cache.Set(1, 1, time.Hour)
 
 	if got, want := cache.Len(), 2; got != want {
-		t.Fatalf("curent cache length %v should be %v", got, want)
+		t.Fatalf("current cache length %v should be %v", got, want)
 	}
 
 	for i := 2; i < 128; i++ {
@@ -105,6 +111,8 @@ func TestTTLCacheLengthWithZeroValue(t *testing.T) {
 }
 
 func TestTTLCacheSetIfAbsent(t *testing.T) {
+	setTTLClockForTest(t, 1000)
+
 	cache := NewTTLCache[int, int](128)
 
 	cache.Set(5, 5, 0)
@@ -138,7 +146,7 @@ func TestTTLCacheSetIfAbsent(t *testing.T) {
 	}
 
 	cache.Set(5, 5, 1*time.Second)
-	time.Sleep(2 * time.Second)
+	advanceTTLClockForTest(t, 2)
 
 	if _, replaced := cache.SetIfAbsent(5, 10, 1*time.Second); !replaced {
 		t.Fatal("should have replaced")
@@ -149,7 +157,7 @@ func TestTTLCacheSetIfAbsent(t *testing.T) {
 	}
 
 	cache.Set(5, 5, 1*time.Second)
-	time.Sleep(2 * time.Second)
+	advanceTTLClockForTest(t, 2)
 
 	if _, replaced := cache.SetIfAbsent(5, 10, 0); !replaced {
 		t.Fatal("should have replaced")
@@ -157,6 +165,51 @@ func TestTTLCacheSetIfAbsent(t *testing.T) {
 
 	if v, ok := cache.Get(5); !ok || v != 10 {
 		t.Fatalf("bad returned value: %v = %v", v, 10)
+	}
+}
+
+func TestTTLCacheSetIfAbsentEvictsWhenFull(t *testing.T) {
+	cache := NewTTLCache[string, int](1, WithShards[string, int](1))
+
+	if prev, replaced := cache.Set("old", 1, time.Hour); replaced || prev != 0 {
+		t.Fatalf("initial insert should not replace: prev=%d replaced=%v", prev, replaced)
+	}
+
+	prev, replaced := cache.SetIfAbsent("new", 2, time.Hour)
+	if replaced || prev != 1 {
+		t.Fatalf("absent insert should evict old value without replacing same key: prev=%d replaced=%v", prev, replaced)
+	}
+	if v, ok := cache.Get("old"); ok || v != 0 {
+		t.Fatalf("old key should be evicted: value=%d ok=%v", v, ok)
+	}
+	if v, ok := cache.Get("new"); !ok || v != 2 {
+		t.Fatalf("new key should be cached: value=%d ok=%v", v, ok)
+	}
+}
+
+func TestTTLCacheSetClearsPreviousTTL(t *testing.T) {
+	cache := NewTTLCache[string, int](1, WithShards[string, int](1))
+
+	cache.Set("a", 1, time.Hour)
+	cache.Set("a", 2, 0)
+	if v, expires, ok := cache.Peek("a"); !ok || v != 2 || expires != 0 {
+		t.Fatalf("updated key should be permanent: value=%v expires=%v ok=%v", v, expires, ok)
+	}
+
+	cache.Set("b", 3, 0)
+	if v, expires, ok := cache.Peek("b"); !ok || v != 3 || expires != 0 {
+		t.Fatalf("reused node should be permanent: value=%v expires=%v ok=%v", v, expires, ok)
+	}
+}
+
+func TestTTLCacheSetIfAbsentPreservesZeroKey(t *testing.T) {
+	cache := NewTTLCache[string, int](128, WithShards[string, int](1))
+
+	cache.Set("", 1, time.Hour)
+	cache.SetIfAbsent("a", 2, time.Hour)
+
+	if v, ok := cache.Get(""); !ok || v != 1 {
+		t.Fatalf("zero key should remain cached: %v, %v", v, ok)
 	}
 }
 
@@ -185,37 +238,37 @@ func TestTTLCacheEviction(t *testing.T) {
 
 	for i := 0; i < 256; i++ {
 		if v, ok := cache.Get(i); ok || v != nil {
-			t.Fatalf("key %v value %v should be evicted", i, *v)
+			t.Fatalf("key %d should be evicted: value=%v ok=%v", i, v, ok)
 		}
 	}
 
 	for i := 256; i < 512; i++ {
-		if v, ok := cache.Get(i); !ok {
-			t.Fatalf("key %v value %v should not be evicted", i, *v)
+		if v, ok := cache.Get(i); !ok || v == nil {
+			t.Fatalf("key %d should not be evicted: value=%v ok=%v", i, v, ok)
 		}
 	}
 
 	for i := 256; i < 384; i++ {
 		cache.Delete(i)
 		if v, ok := cache.Get(i); ok {
-			t.Fatalf("old key %v value %v should be deleted", i, *v)
+			t.Fatalf("old key %d should be deleted: value=%v ok=%v", i, v, ok)
 		}
 	}
 
 	for i := 384; i < 512; i++ {
 		if v, ok := cache.Get(i); !ok || v == nil {
-			t.Fatalf("old key %v value %v should not be deleted", i, *v)
+			t.Fatalf("old key %d should not be deleted: value=%v ok=%v", i, v, ok)
 		}
 	}
 
 	if got, want := cache.Len(), 128; got != want {
-		t.Fatalf("curent cache length %v should be %v", got, want)
+		t.Fatalf("current cache length %v should be %v", got, want)
 	}
 
 	cache.Set(400, &evictedCounter, 0)
 
 	if got, want := len(cache.AppendKeys(nil)), 128; got != want {
-		t.Fatalf("curent cache keys length %v should be %v", got, want)
+		t.Fatalf("current cache keys length %v should be %v", got, want)
 	}
 }
 
@@ -240,14 +293,16 @@ func TestTTLCachePeek(t *testing.T) {
 		cache.Set(k, k, 0)
 	}
 	if v, _, ok := cache.Peek(10); ok || v == 10 {
-		t.Errorf("%v should not have updated recent-ness of 10", v)
+		t.Errorf("peek should not update recency for key 10: value=%d ok=%v", v, ok)
 	}
 	if v, _, ok := cache.Peek(30); ok || v != 0 {
-		t.Errorf("%v should still be absent after miss peek", v)
+		t.Errorf("missing key 30 should remain absent: value=%d ok=%v", v, ok)
 	}
 }
 
 func TestTTLCacheGetWithState(t *testing.T) {
+	setTTLClockForTest(t, 1000)
+
 	cache := NewTTLCache[int, int](64, WithShards[int, int](1))
 
 	cache.Set(1, 10, 0)
@@ -256,7 +311,7 @@ func TestTTLCacheGetWithState(t *testing.T) {
 	}
 
 	cache.Set(2, 20, 1*time.Second)
-	time.Sleep(2100 * time.Millisecond)
+	advanceTTLClockForTest(t, 2)
 
 	if v, state := cache.GetWithState(2); state != TTLStateExpired || v != 20 {
 		t.Fatalf("expected expired state for key 2, got value=%v state=%v", v, state)
@@ -271,11 +326,13 @@ func TestTTLCacheGetWithState(t *testing.T) {
 }
 
 func TestTTLCacheAppendAllKeys(t *testing.T) {
+	setTTLClockForTest(t, 1000)
+
 	cache := NewTTLCache[int, int](64, WithShards[int, int](1))
 
 	cache.Set(1, 10, 0)
 	cache.Set(2, 20, 1*time.Second)
-	time.Sleep(2100 * time.Millisecond)
+	advanceTTLClockForTest(t, 2)
 
 	keys := cache.AppendKeys(nil)
 	if got, want := len(keys), 1; got != want {
@@ -347,6 +404,8 @@ func TestTTLCacheShardCapacityIsLocal(t *testing.T) {
 }
 
 func TestTTLCacheGetWithStateSlidingExtendsTTL(t *testing.T) {
+	setTTLClockForTest(t, 1000)
+
 	cache := NewTTLCache[string, int](16, WithSliding[string, int](true), WithShards[string, int](1))
 	cache.Set("a", 1, 3*time.Second)
 
@@ -355,7 +414,7 @@ func TestTTLCacheGetWithStateSlidingExtendsTTL(t *testing.T) {
 		t.Fatalf("expected key a to exist before sliding read, expires=%v ok=%v", expiresBefore, ok)
 	}
 
-	time.Sleep(1100 * time.Millisecond)
+	advanceTTLClockForTest(t, 1)
 
 	if v, state := cache.GetWithState("a"); state != TTLStateHit || v != 1 {
 		t.Fatalf("expected hit state for key a, got value=%v state=%v", v, state)
@@ -368,10 +427,12 @@ func TestTTLCacheGetWithStateSlidingExtendsTTL(t *testing.T) {
 }
 
 func TestTTLCacheGetWithStateExpiredThenDelete(t *testing.T) {
+	setTTLClockForTest(t, 1000)
+
 	cache := NewTTLCache[string, int](16, WithSliding[string, int](true), WithShards[string, int](1))
 	cache.Set("a", 1, 1*time.Second)
 
-	time.Sleep(2100 * time.Millisecond)
+	advanceTTLClockForTest(t, 2)
 
 	if v, state := cache.GetWithState("a"); state != TTLStateExpired || v != 1 {
 		t.Fatalf("expected expired state for key a, got value=%v state=%v", v, state)
@@ -451,11 +512,13 @@ func TestTTLCacheAppendAllKeysEvictionDropsOldKey(t *testing.T) {
 }
 
 func TestTTLCacheGetWithStateExpiredDoesNotUpdateRecency(t *testing.T) {
+	setTTLClockForTest(t, 1000)
+
 	cache := NewTTLCache[string, int](2, WithShards[string, int](1))
 	cache.Set("a", 1, 1*time.Second)
 	cache.Set("b", 2, 0)
 
-	time.Sleep(2100 * time.Millisecond)
+	advanceTTLClockForTest(t, 2)
 
 	if v, state := cache.GetWithState("a"); state != TTLStateExpired || v != 1 {
 		t.Fatalf("expected expired state for key a, got value=%v state=%v", v, state)
@@ -503,9 +566,11 @@ func TestTTLCacheHasher(t *testing.T) {
 }
 
 func TestTTLCacheLoader(t *testing.T) {
+	setTTLClockForTest(t, 2000)
+
 	cache := NewTTLCache[string, int](1024)
 	if v, err, ok := cache.GetOrLoad(context.Background(), "a", nil); ok || err == nil || v != 0 {
-		t.Errorf("cache.GetOrLoad(\"a\", nil) again should be return error: %v, %v, %v", v, err, ok)
+		t.Fatalf("GetOrLoad without loader should fail: value=%d err=%v ok=%v", v, err, ok)
 	}
 
 	cache = NewTTLCache[string, int](1024, WithLoader[string, int](func(ctx context.Context, key string) (int, time.Duration, error) {
@@ -517,40 +582,41 @@ func TestTTLCacheLoader(t *testing.T) {
 	}))
 
 	if v, err, ok := cache.GetOrLoad(context.Background(), "", nil); ok || err == nil || v != 0 {
-		t.Errorf("cache.GetOrLoad(\"a\", nil) again should be return error: %v, %v, %v", v, err, ok)
+		t.Fatalf("GetOrLoad with invalid key should fail: value=%d err=%v ok=%v", v, err, ok)
 	}
 
 	if v, err, ok := cache.GetOrLoad(context.Background(), "b", nil); ok || err != nil || v != 2 {
-		t.Errorf("cache.GetOrLoad(\"b\", nil) again should be return 2: %v, %v, %v", v, err, ok)
+		t.Fatalf("GetOrLoad should load b=2: value=%d err=%v ok=%v", v, err, ok)
 	}
 
 	if v, err, ok := cache.GetOrLoad(context.Background(), "a", nil); ok || err != nil || v != 1 {
-		t.Errorf("cache.GetOrLoad(\"a\", nil) should be return 1: %v, %v, %v", v, err, ok)
+		t.Fatalf("GetOrLoad should load a=1: value=%d err=%v ok=%v", v, err, ok)
 	}
 
 	if v, err, ok := cache.GetOrLoad(context.Background(), "a", nil); !ok || err != nil || v != 1 {
-		t.Errorf("cache.GetOrLoad(\"a\") again should be return 1: %v, %v, %v", v, err, ok)
+		t.Fatalf("GetOrLoad should hit cached a=1: value=%d err=%v ok=%v", v, err, ok)
 	}
 
-	time.Sleep(2 * time.Second)
+	advanceTTLClockForTest(t, 2)
 
 	if v, err, ok := cache.GetOrLoad(context.Background(), "a", nil); ok || err != nil || v != 1 {
-		t.Errorf("cache.GetOrLoad(\"a\") again should be return 1: %v, %v, %v", v, err, ok)
+		t.Fatalf("GetOrLoad should reload expired a=1: value=%d err=%v ok=%v", v, err, ok)
 	}
 }
 
 func TestTTLCacheLoaderPanic(t *testing.T) {
 	defer func() {
-		if r := recover(); r != nil {
-			if !strings.Contains(fmt.Sprint(r), "not_supported") {
-				t.Errorf("should be not_supported")
-			}
+		r := recover()
+		if r == nil {
+			t.Fatal("LRU-style loader should panic for TTLCache")
+		}
+		if !strings.Contains(fmt.Sprint(r), "not_supported") {
+			t.Fatalf("panic should contain not_supported: %v", r)
 		}
 	}()
 	_ = NewTTLCache[string, int](1024, WithLoader[string, int](func(ctx context.Context, key string) (int, error) {
 		return 1, nil
 	}))
-	t.Errorf("should be panic above")
 }
 
 func TestTTLCacheLoaderSingleflight(t *testing.T) {
@@ -581,6 +647,8 @@ func TestTTLCacheLoaderSingleflight(t *testing.T) {
 }
 
 func TestTTLCacheSlidingGet(t *testing.T) {
+	setTTLClockForTest(t, 3000)
+
 	cache := NewTTLCache[string, int](256, WithSliding[string, int](true), WithShards[string, int](1))
 
 	cache.Set("a", 1, 0)
@@ -589,14 +657,14 @@ func TestTTLCacheSlidingGet(t *testing.T) {
 	cache.Set("d", 3, 1*time.Second)
 
 	if got, want := cache.AppendKeys(nil), 4; len(got) != want {
-		t.Fatalf("curent cache keys %v length should be %v", got, want)
+		t.Fatalf("current cache keys %v length should be %v", got, want)
 	}
 
 	if v, ok := cache.Get("a"); !ok || v != 1 {
 		t.Fatalf("a should be set to 1: %v,", v)
 	}
 
-	time.Sleep(2 * time.Second)
+	advanceTTLClockForTest(t, 2)
 	if v, ok := cache.Get("c"); !ok || v != 3 {
 		t.Errorf("c should be set to 3: %v,", v)
 	}
@@ -605,22 +673,38 @@ func TestTTLCacheSlidingGet(t *testing.T) {
 	}
 
 	if got, want := cache.AppendKeys(nil), 3; len(got) != want {
-		t.Fatalf("curent cache keys %v length should be %v", got, want)
+		t.Fatalf("current cache keys %v length should be %v", got, want)
 	}
 
 	cache.Set("c", 4, 3*time.Second)
 
-	time.Sleep(2 * time.Second)
+	advanceTTLClockForTest(t, 2)
 	if v, ok := cache.Get("c"); !ok || v != 4 {
 		t.Errorf("c should be still set to 4: %v,", v)
 	}
 
-	time.Sleep(1 * time.Second)
+	advanceTTLClockForTest(t, 1)
 
 	if got, want := cache.AppendKeys(nil), 2; len(got) != want {
-		t.Fatalf("curent cache keys %v length should be %v", got, want)
+		t.Fatalf("current cache keys %v length should be %v", got, want)
 	}
+}
 
+func setTTLClockForTest(t *testing.T, now uint32) {
+	t.Helper()
+
+	clocking()
+	previous := atomic.LoadUint32(&clock)
+	atomic.StoreUint32(&clock, now)
+	t.Cleanup(func() {
+		atomic.StoreUint32(&clock, previous)
+	})
+}
+
+func advanceTTLClockForTest(t *testing.T, seconds uint32) {
+	t.Helper()
+
+	atomic.AddUint32(&clock, seconds)
 }
 
 func TestTTLCacheStats(t *testing.T) {
