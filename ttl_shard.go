@@ -93,19 +93,20 @@ func (s *ttlshard[K, V]) GetWithState(hash uint32, key K) (value V, state TTLSta
 	s.statsGetCalls++
 
 	if index, exists := s.tableGet(hash, key); exists {
-		if expires := s.list[index].expires; expires == 0 {
+		node := (*ttlnode[K, V])(unsafe.Add(unsafe.Pointer(unsafe.SliceData(s.list)), uintptr(index)*unsafe.Sizeof(ttlnode[K, V]{})))
+		if expires := node.expires; expires == 0 {
 			s.listMoveToFront(index)
-			value = (*ttlnode[K, V])(unsafe.Add(unsafe.Pointer(&s.list[0]), uintptr(index)*unsafe.Sizeof(s.list[0]))).value
+			value = node.value
 			state = TTLStateHit
 		} else if now := atomic.LoadUint32(&clock); now < expires {
 			if s.sliding {
-				s.list[index].expires = now + s.list[index].ttl
+				node.expires = now + node.ttl
 			}
 			s.listMoveToFront(index)
-			value = (*ttlnode[K, V])(unsafe.Add(unsafe.Pointer(&s.list[0]), uintptr(index)*unsafe.Sizeof(s.list[0]))).value
+			value = node.value
 			state = TTLStateHit
 		} else {
-			value = (*ttlnode[K, V])(unsafe.Add(unsafe.Pointer(&s.list[0]), uintptr(index)*unsafe.Sizeof(s.list[0]))).value
+			value = node.value
 			state = TTLStateExpired
 			s.statsMisses++
 		}

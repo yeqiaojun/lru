@@ -426,7 +426,7 @@ func TestTTLCacheGetWithStateSlidingExtendsTTL(t *testing.T) {
 	}
 }
 
-func TestTTLCacheGetWithStateExpiredThenDelete(t *testing.T) {
+func TestTTLCacheGetWithStateExpiredRetainsValueUntilDelete(t *testing.T) {
 	setTTLClockForTest(t, 1000)
 
 	cache := NewTTLCache[string, int](16, WithSliding[string, int](true), WithShards[string, int](1))
@@ -439,6 +439,12 @@ func TestTTLCacheGetWithStateExpiredThenDelete(t *testing.T) {
 	}
 	if keys := cache.AppendKeys(nil); len(keys) != 0 {
 		t.Fatalf("expected expired key to stay out of AppendKeys, got %v", keys)
+	}
+	if keys := cache.AppendAllKeys(nil); len(keys) != 1 || keys[0] != "a" {
+		t.Fatalf("expected expired key to remain in AppendAllKeys, got %v", keys)
+	}
+	if v, state := cache.GetWithState("a"); state != TTLStateExpired || v != 1 {
+		t.Fatalf("expected expired state before delete, got value=%v state=%v", v, state)
 	}
 
 	cache.Delete("a")
